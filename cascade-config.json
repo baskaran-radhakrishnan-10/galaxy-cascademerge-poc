@@ -1,0 +1,8 @@
+{
+  "cascade_chains": {
+    "release-6.2.1.0": ["release-6.2.3.0", "release-6.3.0.0", "develop"],
+    "release-6.2.3.0": ["release-6.3.0.0", "develop"],
+    "release-6.3.0.0": ["develop"]
+  },
+  "hotfix_branch_pattern": "release-\\d+\\.\\d+\\.\\d+\\.[1-9]\\d*$"
+}

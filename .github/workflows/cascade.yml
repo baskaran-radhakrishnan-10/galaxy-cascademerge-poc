@@ -1,0 +1,242 @@
+name: Cascade Hotfix — Forward PR Automation
+
+on:
+  # Fires when a PR is opened or merged into any branch
+  pull_request:
+    types: [opened, closed]
+
+  # Manual fallback — create forward PRs for a hotfix branch without needing a PR event
+  workflow_dispatch:
+    inputs:
+      hotfix_branch:
+        description: 'Hotfix branch to cascade from (e.g. release-6.2.1.1)'
+        required: true
+      original_pr_number:
+        description: 'Original PR number for reference (optional)'
+        required: false
+        default: '0'
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Notify team when a hotfix PR is raised
+  #
+  # TRIGGER : feature-6.2.1.1 → release-6.2.1.1  (PR OPENED)
+  # PURPOSE : Warn all stakeholders early — "a hotfix is coming, these
+  #           branches will need forward PRs once it is merged."
+  # ─────────────────────────────────────────────────────────────────────────────
+  notify-hotfix-raised:
+    if: github.event_name == 'pull_request' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    name: Notify — Hotfix PR Raised
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Send Hotfix Raised Email
+        env:
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:     ${{ secrets.SMTP_FROM }}
+        run: |
+          python - <<'EOF'
+          import json, sys, os, re
+          sys.path.insert(0, os.getcwd())
+          from notifications.email_notifier import notify_hotfix_raised
+
+          with open("cascade-config.json") as f:
+              config = json.load(f)
+
+          base_branch = "${{ github.event.pull_request.base.ref }}"
+          pattern     = config.get("hotfix_branch_pattern", "")
+
+          # Only notify if the PR targets a hotfix branch (release-X.Y.Z.N where N >= 1)
+          if pattern and not re.search(pattern, base_branch):
+              print(f"[SKIP] '{base_branch}' is not a hotfix branch. No notification sent.")
+              sys.exit(0)
+
+          # Derive the base release branch: release-6.2.1.1 → release-6.2.1.0
+          base_release = re.sub(r'\.\d+$', '.0', base_branch)
+          chain        = config["cascade_chains"].get(base_release, [])
+
+          notify_hotfix_raised(
+              pr_number     = ${{ github.event.pull_request.number }},
+              pr_title      = "${{ github.event.pull_request.title }}",
+              pr_url        = "${{ github.event.pull_request.html_url }}",
+              author        = "${{ github.event.pull_request.user.login }}",
+              source_branch = "${{ github.event.pull_request.head.ref }}",
+              target_branch = base_branch,
+              cascade_chain = chain,
+          )
+          print("Hotfix raised notification sent successfully.")
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Create forward PRs once the hotfix PR is merged
+  #
+  # TRIGGER : feature-6.2.1.1 → release-6.2.1.1  (PR MERGED)
+  #           OR manual workflow_dispatch
+  #
+  # PURPOSE : Automatically open PRs:
+  #             release-6.2.1.1 → release-6.2.3.0
+  #             release-6.2.1.1 → release-6.3.0.0
+  #             release-6.2.1.1 → develop
+  #           Each PR is assigned to the correct team lead for review & merge.
+  #           An email is sent with clickable PR links.
+  #
+  # NOTE    : This job CREATES PRs — it does NOT auto-merge.
+  #           Dev leads review and merge them through the normal GitHub flow.
+  # ─────────────────────────────────────────────────────────────────────────────
+  create-forward-prs:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'closed' &&
+       github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    name: Create — Forward Cascade PRs
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Create forward PRs and send notifications
+        env:
+          GH_PAT:            ${{ secrets.GH_PAT }}
+          SMTP_HOST:         ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:         ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME:     ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD:     ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:         ${{ secrets.SMTP_FROM }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'EOF'
+          import json, os, re, sys, requests
+          sys.path.insert(0, os.getcwd())
+          from notifications.email_notifier import notify_forward_prs_created
+
+          # ── Load config ──────────────────────────────────────────────────────
+          with open("cascade-config.json") as f:
+              config = json.load(f)
+
+          # ── Resolve inputs (PR event vs manual dispatch) ─────────────────────
+          event = "${{ github.event_name }}"
+
+          if event == "workflow_dispatch":
+              hotfix_branch   = "${{ github.event.inputs.hotfix_branch }}"
+              feature_branch  = hotfix_branch            # not available on manual run
+              pr_number       = int("${{ github.event.inputs.original_pr_number }}" or "0")
+              pr_title        = f"Manual cascade from {hotfix_branch}"
+              pr_url          = ""
+              pr_author       = "${{ github.actor }}"
+          else:
+              hotfix_branch   = "${{ github.event.pull_request.base.ref }}"
+              feature_branch  = "${{ github.event.pull_request.head.ref }}"
+              pr_number       = ${{ github.event.pull_request.number }}
+              pr_title        = "${{ github.event.pull_request.title }}"
+              pr_url          = "${{ github.event.pull_request.html_url }}"
+              pr_author       = "${{ github.event.pull_request.user.login }}"
+
+          # ── Validate: base must be a hotfix branch ───────────────────────────
+          pattern = config.get("hotfix_branch_pattern", "")
+          if pattern and not re.search(pattern, hotfix_branch):
+              print(f"[SKIP] '{hotfix_branch}' is not a hotfix branch. No cascade triggered.")
+              sys.exit(0)
+
+          # ── Derive base release and cascade targets ──────────────────────────
+          # release-6.2.1.1 → release-6.2.1.0 → lookup cascade chain
+          base_release = re.sub(r'\.\d+$', '.0', hotfix_branch)
+          targets      = config["cascade_chains"].get(base_release, [])
+
+          if not targets:
+              print(f"[SKIP] No cascade chain defined for base release '{base_release}'.")
+              sys.exit(0)
+
+          print(f"Hotfix branch : {hotfix_branch}")
+          print(f"Base release  : {base_release}")
+          print(f"Cascade chain : {' → '.join(targets)}")
+
+          # ── GitHub API setup ─────────────────────────────────────────────────
+          token   = os.environ["GH_PAT"]
+          repo    = os.environ["GITHUB_REPOSITORY"]
+          api_url = f"https://api.github.com/repos/{repo}/pulls"
+          headers = {
+              "Authorization": f"token {token}",
+              "Accept":        "application/vnd.github.v3+json",
+          }
+
+          # ── Create one forward PR per cascade target ─────────────────────────
+          created_prs = []
+          skipped_prs = []
+
+          for target in targets:
+              pr_body = (
+                  f"## 🤖 Automated Cascade Forward PR\n\n"
+                  f"| Field | Value |\n"
+                  f"|---|---|\n"
+                  f"| **Original PR** | [{pr_title}]({pr_url}) (#{pr_number}) |\n"
+                  f"| **Merged by** | {pr_author} |\n"
+                  f"| **Hotfix branch** | `{hotfix_branch}` |\n"
+                  f"| **Forward target** | `{target}` |\n\n"
+                  f"---\n\n"
+                  f"This PR was automatically created by the **Galaxy Cascade Automation**.\n\n"
+                  f"Please review the changes and merge to propagate the hotfix into `{target}`.\n\n"
+                  f"> ⚠️ Do **not** close this PR without merging unless the fix is explicitly not applicable to `{target}`."
+              )
+
+              resp = requests.post(api_url, headers=headers, json={
+                  "title": f"chore: cascade {hotfix_branch} → {target} [from #{pr_number}]",
+                  "head":  hotfix_branch,
+                  "base":  target,
+                  "body":  pr_body,
+              })
+
+              if resp.status_code == 201:
+                  data = resp.json()
+                  created_prs.append({
+                      "target": target,
+                      "url":    data["html_url"],
+                      "number": data["number"],
+                  })
+                  print(f"[OK] Created PR #{data['number']}: {hotfix_branch} → {target}  ({data['html_url']})")
+
+              else:
+                  err_data = resp.json()
+                  err_msg  = (
+                      err_data.get("errors", [{}])[0].get("message")
+                      or err_data.get("message", f"HTTP {resp.status_code}")
+                  )
+                  skipped_prs.append({"target": target, "reason": err_msg})
+                  print(f"[WARN] Could not create PR for '{target}': {err_msg}")
+
+          # ── Send notification email ──────────────────────────────────────────
+          if created_prs or skipped_prs:
+              notify_forward_prs_created(
+                  original_pr_number = pr_number,
+                  original_pr_title  = pr_title,
+                  original_pr_url    = pr_url,
+                  author             = pr_author,
+                  hotfix_branch      = hotfix_branch,
+                  created_prs        = created_prs,
+                  skipped_prs        = skipped_prs,
+              )
+              print(f"\nSummary — Created: {len(created_prs)} | Skipped: {len(skipped_prs)}")
+          else:
+              print("No PRs created and no PRs skipped — nothing to notify.")
+          EOF
