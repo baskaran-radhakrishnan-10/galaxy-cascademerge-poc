@@ -1,0 +1,218 @@
+name: Cascade Hotfix Merge
+
+on:
+  # Fires automatically when a hotfix PR is opened — sends notification email
+  pull_request:
+    types: [opened]
+
+  # Fires manually — performs the actual cascade merge after PR is merged
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: 'Hotfix branch to cascade from (e.g. release-6.2.1.1)'
+        required: true
+      cascade_targets:
+        description: 'Ordered merge targets, comma-separated (e.g. release-6.2.3.0,release-6.3.0.0,develop)'
+        required: true
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 1: Notify team when a hotfix PR is opened
+  # Reads cascade-config.json to show the full merge chain in the email.
+  # ─────────────────────────────────────────────────────────────────────────
+  notify-hotfix-raised:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    name: Notify — Hotfix PR Raised
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Send Hotfix Raised Email
+        env:
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:     ${{ secrets.SMTP_FROM }}
+        run: |
+          python - <<'EOF'
+          import json, sys, os
+          sys.path.insert(0, os.getcwd())
+          from notifications.email_notifier import notify_hotfix_raised
+
+          with open("cascade-config.json") as f:
+              config = json.load(f)
+
+          base_branch = "${{ github.event.pull_request.base.ref }}"
+          chain       = config["cascade_chains"].get(base_branch, [])
+
+          notify_hotfix_raised(
+              pr_number     = ${{ github.event.pull_request.number }},
+              pr_title      = "${{ github.event.pull_request.title }}",
+              pr_url        = "${{ github.event.pull_request.html_url }}",
+              author        = "${{ github.event.pull_request.user.login }}",
+              source_branch = "${{ github.event.pull_request.head.ref }}",
+              target_branch = base_branch,
+              cascade_chain = chain,
+          )
+          print("Hotfix raised email sent successfully.")
+          EOF
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 2: Merge the hotfix into the first cascade target
+  # Runs only when triggered manually via workflow_dispatch.
+  # ─────────────────────────────────────────────────────────────────────────
+  merge-first-target:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    name: Merge — into First Target
+    outputs:
+      first_target: ${{ steps.parse.outputs.first }}
+      remaining:    ${{ steps.parse.outputs.remaining }}
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Parse cascade targets
+        id: parse
+        run: |
+          IFS=',' read -ra TARGETS <<< "${{ github.event.inputs.cascade_targets }}"
+          echo "first=${TARGETS[0]}" >> $GITHUB_OUTPUT
+          remaining=$(IFS=','; echo "${TARGETS[*]:1}")
+          echo "remaining=$remaining" >> $GITHUB_OUTPUT
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge source into first target
+        run: |
+          SOURCE="${{ github.event.inputs.source_branch }}"
+          TARGET="${{ steps.parse.outputs.first }}"
+          echo "Merging $SOURCE → $TARGET"
+          git fetch origin
+          git checkout "$TARGET"
+          git pull origin "$TARGET"
+          git merge "origin/$SOURCE" --no-ff \
+            -m "chore: cascade merge $SOURCE into $TARGET [automated]"
+          git push origin "$TARGET"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # JOB 3: Cascade through all remaining targets in order
+  # Sends a conflict alert email and fails loudly if any merge conflicts.
+  # ─────────────────────────────────────────────────────────────────────────
+  cascade-remaining:
+    needs: merge-first-target
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    name: Cascade — Remaining Targets
+
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Configure Git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sequential cascade merge with conflict alerting
+        env:
+          SMTP_HOST:    ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:    ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:    ${{ secrets.SMTP_FROM }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FIRST_TARGET: ${{ needs.merge-first-target.outputs.first_target }}
+          REMAINING:    ${{ needs.merge-first-target.outputs.remaining }}
+          SOURCE:       ${{ github.event.inputs.source_branch }}
+        run: |
+          python - <<'EOF'
+          import subprocess, os, sys
+          sys.path.insert(0, os.getcwd())
+          from notifications.email_notifier import notify_merge_conflict
+
+          source      = os.environ["SOURCE"]
+          first       = os.environ["FIRST_TARGET"]
+          remaining   = os.environ.get("REMAINING", "").strip()
+          workflow_url = os.environ["WORKFLOW_URL"]
+
+          if not remaining:
+              print("No further targets after first. Cascade complete.")
+              sys.exit(0)
+
+          targets   = [t.strip() for t in remaining.split(",") if t.strip()]
+          completed = [first]   # first target was already merged in Job 2
+
+          def git(cmd: str) -> int:
+              result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              if result.stdout:
+                  print(result.stdout)
+              if result.stderr:
+                  print(result.stderr)
+              return result.returncode
+
+          git("git fetch origin")
+
+          for i, target in enumerate(targets):
+              prev = completed[-1]   # always merge from the last successfully merged branch
+              print(f"\n{'='*60}")
+              print(f"Merging  {prev}  →  {target}")
+              print(f"{'='*60}")
+
+              git(f"git checkout {target}")
+              git(f"git pull origin {target}")
+
+              rc = git(
+                  f"git merge origin/{prev} --no-ff "
+                  f"-m 'chore: cascade merge {prev} into {target} [automated]'"
+              )
+
+              if rc != 0:
+                  pending = targets[i + 1:]
+                  print(f"\n[CONFLICT] Merge failed at {target}. Sending alert email...")
+                  notify_merge_conflict(
+                      source_branch    = source,
+                      conflict_branch  = target,
+                      completed_merges = completed,
+                      pending_merges   = pending,
+                      pr_number        = 0,
+                      workflow_url     = workflow_url,
+                  )
+                  # Abort the in-progress merge so the workspace is clean
+                  subprocess.run("git merge --abort", shell=True)
+                  print(f"::error::Merge conflict detected at {target}. Manual resolution required.")
+                  sys.exit(1)
+
+              push_rc = git(f"git push origin {target}")
+              if push_rc != 0:
+                  print(f"::error::Failed to push {target} after merge.")
+                  sys.exit(1)
+
+              completed.append(target)
+              print(f"[OK] Successfully merged and pushed → {target}")
+
+          print("\n✅ Full cascade complete. All branches are up to date.")
+          EOF

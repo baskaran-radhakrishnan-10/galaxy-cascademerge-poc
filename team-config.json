@@ -1,0 +1,25 @@
+{
+  "teams": {
+    "release-6.2.1.0": {
+      "lead": "your_email@gmail.com",
+      "release_manager": "your_email@gmail.com",
+      "developers": ["your_email@gmail.com"]
+    },
+    "release-6.2.3.0": {
+      "lead": "your_email@gmail.com",
+      "release_manager": "your_email@gmail.com",
+      "developers": ["your_email@gmail.com"]
+    },
+    "release-6.3.0.0": {
+      "lead": "your_email@gmail.com",
+      "release_manager": "your_email@gmail.com",
+      "developers": ["your_email@gmail.com"]
+    },
+    "develop": {
+      "lead": "your_email@gmail.com",
+      "release_manager": "your_email@gmail.com",
+      "developers": []
+    }
+  },
+  "always_notify": ["your_email@gmail.com"]
+}
