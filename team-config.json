@@ -1,25 +1,25 @@
 {
   "teams": {
     "release-6.2.1.0": {
-      "lead": "your_email@gmail.com",
-      "release_manager": "your_email@gmail.com",
-      "developers": ["your_email@gmail.com"]
+      "lead": "baskaran.java@gmail.com",
+      "release_manager": "baskaran.java@gmail.com",
+      "developers": ["baskaran.java@gmail.com"]
     },
     "release-6.2.3.0": {
-      "lead": "your_email@gmail.com",
-      "release_manager": "your_email@gmail.com",
-      "developers": ["your_email@gmail.com"]
+      "lead": "baskaran.coder@gmail.com",
+      "release_manager": "baskaran.coder@gmail.com",
+      "developers": ["baskaran.coder@gmail.com"]
     },
     "release-6.3.0.0": {
-      "lead": "your_email@gmail.com",
-      "release_manager": "your_email@gmail.com",
-      "developers": ["your_email@gmail.com"]
+      "lead": "baskaran.radhakrishnan.it@gmail.com",
+      "release_manager": "baskaran.radhakrishnan.it@gmail.com",
+      "developers": ["baskaran.radhakrishnan.it@gmail.com"]
     },
     "develop": {
-      "lead": "your_email@gmail.com",
-      "release_manager": "your_email@gmail.com",
+      "lead": "baskaran.radhakrishnan@finzly.com",
+      "release_manager": "baskaran.radhakrishnan@finzly.com",
       "developers": []
     }
   },
-  "always_notify": ["your_email@gmail.com"]
+  "always_notify": ["baskaran.java@gmail.com"]
 }
