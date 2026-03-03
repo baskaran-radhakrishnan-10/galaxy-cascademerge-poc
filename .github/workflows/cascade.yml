@@ -1,0 +1,171 @@
+name: Cascade Hotfix — Forward PR Automation
+
+on:
+  # Fires when a PR is merged into any branch
+  pull_request:
+    types: [closed]
+
+  # Manual fallback — create forward PRs for a hotfix branch without needing a PR event
+  workflow_dispatch:
+    inputs:
+      hotfix_branch:
+        description: 'Hotfix branch to cascade from (e.g. release-6.2.1.1)'
+        required: true
+      original_pr_number:
+        description: 'Original PR number for reference (optional)'
+        required: false
+        default: '0'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PIPELINE OVERVIEW
+#
+#  ┌──────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
+#  │  Job 1               │────►│  Job 2               │────►│  Job 3              │
+#  │  🔍 Validate         │     │  🔀 Create Forward   │     │  📧 Notify via      │
+#  │  Derive & Lookup     │     │  PRs                 │     │  Email              │
+#  └──────────────────────┘     └──────────────────────┘     └─────────────────────┘
+#
+#  Python scripts (in scripts/ folder):
+#    Job 1  →  scripts/validate.py
+#    Job 2  →  scripts/create_prs.py
+#    Job 3  →  scripts/notify.py
+#
+#  Artifact data flow:
+#    Job 1  →  uploads  cascade_context.json
+#    Job 2  →  downloads cascade_context.json
+#           →  uploads  cascade_results.json
+#    Job 3  →  downloads cascade_context.json + cascade_results.json
+# ─────────────────────────────────────────────────────────────────────────────
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Validate, Derive & Lookup
+  # Script: scripts/validate.py
+  #
+  # Validates the merged PR targets a hotfix branch, derives the base release,
+  # and resolves cascade targets from cascade-config.json.
+  # ───────────────────────────────────────────────────────────────────────────
+  validate:
+    name: "🔍 Validate, Derive & Lookup"
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'closed' &&
+       github.event.pull_request.merged == true)
+    runs-on: ubuntu-latest
+    outputs:
+      should_proceed: ${{ steps.run.outputs.should_proceed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Validate, Derive & Lookup
+        id: run
+        env:
+          EVENT_NAME:       ${{ github.event_name }}
+          PR_BASE_REF:      ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER:        ${{ github.event.pull_request.number }}
+          PR_TITLE:         ${{ github.event.pull_request.title }}
+          PR_URL:           ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR:        ${{ github.event.pull_request.user.login }}
+          ACTOR:            ${{ github.actor }}
+          INPUT_HOTFIX:     ${{ github.event.inputs.hotfix_branch }}
+          INPUT_PR_NUMBER:  ${{ github.event.inputs.original_pr_number }}
+        run: python scripts/validate.py
+
+      - name: Upload cascade context artifact
+        if: steps.run.outputs.should_proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cascade-context
+          path: cascade_context.json
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Create Forward PRs
+  # Script: scripts/create_prs.py
+  #
+  # Calls GitHub REST API to open one forward PR per cascade target.
+  # Runs only if Job 1 sets should_proceed = true.
+  # ───────────────────────────────────────────────────────────────────────────
+  create-prs:
+    name: "🔀 Create Forward PRs"
+    needs: validate
+    if: needs.validate.outputs.should_proceed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Download cascade context from Job 1
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-context
+
+      - name: Create forward PRs via GitHub API
+        env:
+          GH_PAT:            ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/create_prs.py
+
+      - name: Upload cascade results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cascade-results
+          path: cascade_results.json
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Notify via Email
+  # Script: scripts/notify.py
+  #
+  # Sends HTML email to all target branch leads with clickable PR links.
+  # Runs only if Job 1 sets should_proceed = true AND Job 2 succeeds.
+  # ───────────────────────────────────────────────────────────────────────────
+  notify:
+    name: "📧 Notify via Email"
+    needs: [validate, create-prs]
+    if: needs.validate.outputs.should_proceed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Download cascade context from Job 1
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-context
+
+      - name: Download cascade results from Job 2
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-results
+
+      - name: Send email notification with PR links
+        env:
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:     ${{ secrets.SMTP_FROM }}
+        run: python scripts/notify.py
