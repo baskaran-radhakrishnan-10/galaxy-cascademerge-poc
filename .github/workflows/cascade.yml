@@ -16,38 +16,174 @@ on:
         required: false
         default: '0'
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  PIPELINE OVERVIEW
+#
+#  ┌──────────────────────┐     ┌──────────────────────┐     ┌─────────────────────┐
+#  │  Job 1               │────►│  Job 2               │────►│  Job 3              │
+#  │  Validate            │     │  Create Forward PRs  │     │  Notify via Email   │
+#  │  Derive & Lookup     │     │  via GitHub API      │     │  with PR Links      │
+#  └──────────────────────┘     └──────────────────────┘     └─────────────────────┘
+#
+#  Data flow between jobs:
+#    Job 1 → uploads cascade_context.json  (artifact)
+#    Job 2 → downloads cascade_context.json
+#          → uploads cascade_results.json  (artifact)
+#    Job 3 → downloads both artifacts and sends email
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # JOB: Create forward PRs once the hotfix PR is merged
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Validate, Derive & Lookup
   #
-  # TRIGGER : feature-6.2.1.1 → release-6.2.1.1  (PR MERGED)
-  #           OR manual workflow_dispatch
+  # Purpose:
+  #   Reads the trigger event, validates the hotfix branch pattern,
+  #   derives the base release, and resolves cascade targets from
+  #   cascade-config.json. Writes cascade_context.json as a
+  #   GitHub Artifact for Jobs 2 and 3 to consume.
   #
-  # STEPS:
-  #   Step 1 — Validate, Derive & Lookup
-  #            Confirms the merged PR targets a hotfix branch, derives the base
-  #            release, and resolves cascade targets from cascade-config.json.
-  #            Writes cascade_context.json for downstream steps.
-  #
-  #   Step 2 — Create PRs via GitHub API
-  #            Opens one forward PR per cascade target.
-  #            Writes cascade_results.json for the notification step.
-  #
-  #   Step 3 — Send Email with PR Links
-  #            Emails all relevant team leads with clickable PR links.
-  #
-  # NOTE: This job CREATES PRs — it does NOT auto-merge.
-  #       Dev leads review and merge them through the normal GitHub flow.
-  # ─────────────────────────────────────────────────────────────────────────────
-  create-forward-prs:
+  # Output:
+  #   should_proceed  →  true/false  (controls whether Jobs 2 & 3 run)
+  #   artifact        →  cascade_context.json
+  # ───────────────────────────────────────────────────────────────────────────
+  validate:
+    name: "Step 1 — Validate, Derive & Lookup"
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
        github.event.action == 'closed' &&
        github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
-    name: Create — Forward Cascade PRs
+    outputs:
+      should_proceed: ${{ steps.run.outputs.should_proceed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Validate, Derive & Lookup
+        id: run
+        run: |
+          python - <<'EOF'
+          import json, os, re, sys
+
+          print("=" * 60)
+          print("JOB 1 — Validate, Derive & Lookup")
+          print("=" * 60)
+
+          # ── Load cascade configuration ─────────────────────────────────
+          print("\n[1/4] Loading cascade-config.json ...")
+          with open("cascade-config.json") as f:
+              config = json.load(f)
+          print(f"      Cascade chains loaded : {list(config['cascade_chains'].keys())}")
+
+          # ── Resolve PR details from event or manual input ──────────────
+          print("\n[2/4] Resolving trigger inputs ...")
+          event = "${{ github.event_name }}"
+          print(f"      Trigger event  : {event}")
+
+          if event == "workflow_dispatch":
+              hotfix_branch = "${{ github.event.inputs.hotfix_branch }}"
+              pr_number     = int("${{ github.event.inputs.original_pr_number }}" or "0")
+              pr_title      = f"Manual cascade from {hotfix_branch}"
+              pr_url        = ""
+              pr_author     = "${{ github.actor }}"
+              print(f"      Mode           : Manual dispatch")
+          else:
+              hotfix_branch = "${{ github.event.pull_request.base.ref }}"
+              pr_number     = ${{ github.event.pull_request.number }}
+              pr_title      = "${{ github.event.pull_request.title }}"
+              pr_url        = "${{ github.event.pull_request.html_url }}"
+              pr_author     = "${{ github.event.pull_request.user.login }}"
+              print(f"      Mode           : PR merge event")
+
+          print(f"      Hotfix branch  : {hotfix_branch}")
+          print(f"      PR number      : #{pr_number}")
+          print(f"      PR title       : {pr_title}")
+          print(f"      PR author      : {pr_author}")
+
+          # ── Validate: target branch must match hotfix pattern ──────────
+          print("\n[3/4] Validating hotfix branch pattern ...")
+          pattern = config.get("hotfix_branch_pattern", "")
+          print(f"      Pattern        : {pattern}")
+
+          if pattern and not re.search(pattern, hotfix_branch):
+              print(f"      [SKIP] '{hotfix_branch}' does NOT match hotfix pattern.")
+              print(f"             This is not a hotfix branch — no cascade triggered.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("should_proceed=false\n")
+              sys.exit(0)
+
+          print(f"      [PASS] '{hotfix_branch}' matches hotfix pattern ✓")
+
+          # ── Derive base release & lookup cascade chain ─────────────────
+          print("\n[4/4] Deriving base release and looking up cascade chain ...")
+          base_release = re.sub(r'\.\d+$', '.0', hotfix_branch)
+          print(f"      Derivation     : {hotfix_branch}  →  {base_release}")
+
+          targets = config["cascade_chains"].get(base_release, [])
+
+          if not targets:
+              print(f"      [SKIP] No cascade chain found for '{base_release}' in cascade-config.json.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("should_proceed=false\n")
+              sys.exit(0)
+
+          print(f"      Cascade chain  : {' → '.join(targets)}")
+          print(f"      Total targets  : {len(targets)} forward PR(s) to be created")
+
+          # ── Write cascade_context.json (shared with Jobs 2 & 3) ───────
+          context = {
+              "hotfix_branch": hotfix_branch,
+              "base_release":  base_release,
+              "targets":       targets,
+              "pr_number":     pr_number,
+              "pr_title":      pr_title,
+              "pr_url":        pr_url,
+              "pr_author":     pr_author,
+          }
+          with open("cascade_context.json", "w") as f:
+              json.dump(context, f, indent=2)
+          print(f"\n      cascade_context.json written successfully.")
+          print(f"      Contents: {json.dumps(context, indent=6)}")
+
+          # ── Signal Jobs 2 & 3 to proceed ──────────────────────────────
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("should_proceed=true\n")
+
+          print("\n✅ Job 1 complete — cascade validated and ready.")
+          print("=" * 60)
+          EOF
+
+      - name: Upload cascade context artifact
+        if: steps.run.outputs.should_proceed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cascade-context
+          path: cascade_context.json
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 2 — Create Forward PRs via GitHub API
+  #
+  # Purpose:
+  #   Downloads cascade_context.json from Job 1.
+  #   Calls GitHub REST API to open one forward PR per cascade target.
+  #   Writes cascade_results.json as a GitHub Artifact for Job 3 to consume.
+  #
+  # Runs only if:  Job 1 sets should_proceed = true
+  # Output:        artifact → cascade_results.json
+  # ───────────────────────────────────────────────────────────────────────────
+  create-prs:
+    name: "Step 2 — Create Forward PRs"
+    needs: validate
+    if: needs.validate.outputs.should_proceed == 'true'
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -61,124 +197,12 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
-      # ───────────────────────────────────────────────────────────────────────
-      # STEP 1 — Validate, Derive & Lookup
-      #
-      # What this step does:
-      #   1. Reads the trigger event (PR merge or manual dispatch)
-      #   2. Checks: is the target branch a hotfix branch? (e.g. release-6.2.1.1)
-      #   3. Derives the base release:  release-6.2.1.1 → release-6.2.1.0
-      #   4. Looks up the cascade chain in cascade-config.json
-      #   5. Writes cascade_context.json  ← consumed by Steps 2 & 3
-      #   6. Sets GITHUB_OUTPUT: should_proceed=true/false  ← controls Steps 2 & 3
-      # ───────────────────────────────────────────────────────────────────────
-      - name: "Step 1 — Validate, Derive & Lookup"
-        id: validate
-        run: |
-          python - <<'EOF'
-          import json, os, re, sys
+      - name: Download cascade context from Job 1
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-context
 
-          print("=" * 60)
-          print("STEP 1 — Validate, Derive & Lookup")
-          print("=" * 60)
-
-          # ── Load cascade configuration ───────────────────────────────────
-          print("\n[1/4] Loading cascade-config.json ...")
-          with open("cascade-config.json") as f:
-              config = json.load(f)
-          print(f"      Loaded cascade chains: {list(config['cascade_chains'].keys())}")
-
-          # ── Resolve PR details from event or manual input ────────────────
-          print("\n[2/4] Resolving trigger inputs ...")
-          event = "${{ github.event_name }}"
-          print(f"      Trigger event : {event}")
-
-          if event == "workflow_dispatch":
-              hotfix_branch = "${{ github.event.inputs.hotfix_branch }}"
-              pr_number     = int("${{ github.event.inputs.original_pr_number }}" or "0")
-              pr_title      = f"Manual cascade from {hotfix_branch}"
-              pr_url        = ""
-              pr_author     = "${{ github.actor }}"
-              print(f"      Mode          : Manual dispatch")
-          else:
-              hotfix_branch = "${{ github.event.pull_request.base.ref }}"
-              pr_number     = ${{ github.event.pull_request.number }}
-              pr_title      = "${{ github.event.pull_request.title }}"
-              pr_url        = "${{ github.event.pull_request.html_url }}"
-              pr_author     = "${{ github.event.pull_request.user.login }}"
-              print(f"      Mode          : PR merge event")
-
-          print(f"      Hotfix branch : {hotfix_branch}")
-          print(f"      PR number     : #{pr_number}")
-          print(f"      PR title      : {pr_title}")
-          print(f"      PR author     : {pr_author}")
-
-          # ── Validate: target branch must match hotfix pattern ────────────
-          print("\n[3/4] Validating hotfix branch pattern ...")
-          pattern = config.get("hotfix_branch_pattern", "")
-          print(f"      Pattern       : {pattern}")
-
-          if pattern and not re.search(pattern, hotfix_branch):
-              print(f"      [SKIP] '{hotfix_branch}' does NOT match hotfix pattern.")
-              print(f"             No cascade will be triggered.")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("should_proceed=false\n")
-              sys.exit(0)
-
-          print(f"      [PASS] '{hotfix_branch}' matches hotfix pattern.")
-
-          # ── Derive base release & lookup cascade chain ───────────────────
-          print("\n[4/4] Deriving base release and looking up cascade chain ...")
-          base_release = re.sub(r'\.\d+$', '.0', hotfix_branch)
-          print(f"      Derivation    : {hotfix_branch}  →  {base_release}")
-
-          targets = config["cascade_chains"].get(base_release, [])
-
-          if not targets:
-              print(f"      [SKIP] No cascade chain found for '{base_release}' in cascade-config.json.")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("should_proceed=false\n")
-              sys.exit(0)
-
-          print(f"      Cascade chain : {' → '.join(targets)}")
-          print(f"      Total targets : {len(targets)} PR(s) will be created")
-
-          # ── Write context file for Steps 2 & 3 ──────────────────────────
-          context = {
-              "hotfix_branch": hotfix_branch,
-              "base_release":  base_release,
-              "targets":       targets,
-              "pr_number":     pr_number,
-              "pr_title":      pr_title,
-              "pr_url":        pr_url,
-              "pr_author":     pr_author,
-          }
-          with open("cascade_context.json", "w") as f:
-              json.dump(context, f, indent=2)
-          print(f"\n      cascade_context.json written — ready for Step 2.")
-
-          # ── Signal downstream steps to proceed ───────────────────────────
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write("should_proceed=true\n")
-
-          print("\n✅ Step 1 complete — cascade is valid and ready to proceed.")
-          print("=" * 60)
-          EOF
-
-      # ───────────────────────────────────────────────────────────────────────
-      # STEP 2 — Create PRs via GitHub API
-      #
-      # What this step does:
-      #   1. Reads cascade_context.json written by Step 1
-      #   2. For each cascade target, calls GitHub REST API to open a PR
-      #   3. Each PR body references the original hotfix PR for traceability
-      #   4. Writes cascade_results.json  ← consumed by Step 3
-      #
-      # Skipped automatically if Step 1 sets should_proceed=false
-      # ───────────────────────────────────────────────────────────────────────
-      - name: "Step 2 — Create PRs via GitHub API"
-        id: create-prs
-        if: steps.validate.outputs.should_proceed == 'true'
+      - name: Create forward PRs via GitHub API
         env:
           GH_PAT:            ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -187,11 +211,11 @@ jobs:
           import json, os, sys, requests
 
           print("=" * 60)
-          print("STEP 2 — Create PRs via GitHub API")
+          print("JOB 2 — Create Forward PRs via GitHub API")
           print("=" * 60)
 
-          # ── Load context from Step 1 ─────────────────────────────────────
-          print("\n[1/3] Loading cascade_context.json from Step 1 ...")
+          # ── Load context from Job 1 ────────────────────────────────────
+          print("\n[1/3] Loading cascade_context.json from Job 1 ...")
           with open("cascade_context.json") as f:
               ctx = json.load(f)
 
@@ -202,11 +226,11 @@ jobs:
           pr_url        = ctx["pr_url"]
           pr_author     = ctx["pr_author"]
 
-          print(f"      Hotfix branch : {hotfix_branch}")
-          print(f"      Targets       : {targets}")
-          print(f"      Original PR   : #{pr_number} by {pr_author}")
+          print(f"      Hotfix branch  : {hotfix_branch}")
+          print(f"      Targets        : {targets}")
+          print(f"      Original PR    : #{pr_number} by {pr_author}")
 
-          # ── Setup GitHub API ─────────────────────────────────────────────
+          # ── Setup GitHub API client ────────────────────────────────────
           print("\n[2/3] Setting up GitHub API connection ...")
           token   = os.environ["GH_PAT"]
           repo    = os.environ["GITHUB_REPOSITORY"]
@@ -215,16 +239,16 @@ jobs:
               "Authorization": f"token {token}",
               "Accept":        "application/vnd.github.v3+json",
           }
-          print(f"      Repository    : {repo}")
-          print(f"      API endpoint  : {api_url}")
+          print(f"      Repository     : {repo}")
+          print(f"      API endpoint   : {api_url}")
 
-          # ── Create one PR per cascade target ─────────────────────────────
+          # ── Create one forward PR per cascade target ───────────────────
           print(f"\n[3/3] Creating {len(targets)} forward PR(s) ...")
           created_prs = []
           skipped_prs = []
 
           for i, target in enumerate(targets, start=1):
-              print(f"\n      [{i}/{len(targets)}] {hotfix_branch}  →  {target}")
+              print(f"\n      [{i}/{len(targets)}] Attempting: {hotfix_branch}  →  {target}")
 
               pr_body = (
                   f"## 🤖 Automated Cascade Forward PR\n\n"
@@ -246,7 +270,8 @@ jobs:
                   "base":  target,
                   "body":  pr_body,
               }
-              print(f"             Calling GitHub API ...")
+
+              print(f"             Calling GitHub REST API ...")
               resp = requests.post(api_url, headers=headers, json=payload)
               print(f"             Response status : HTTP {resp.status_code}")
 
@@ -257,7 +282,8 @@ jobs:
                       "url":    data["html_url"],
                       "number": data["number"],
                   })
-                  print(f"             [OK] PR #{data['number']} created → {data['html_url']}")
+                  print(f"             [OK] PR #{data['number']} created")
+                  print(f"                  URL : {data['html_url']}")
 
               else:
                   err_data = resp.json()
@@ -268,32 +294,57 @@ jobs:
                   skipped_prs.append({"target": target, "reason": err_msg})
                   print(f"             [WARN] Could not create PR — {err_msg}")
 
-          # ── Write results file for Step 3 ────────────────────────────────
-          results = {
-              "created_prs": created_prs,
-              "skipped_prs": skipped_prs,
-          }
+          # ── Write results for Job 3 ────────────────────────────────────
+          results = {"created_prs": created_prs, "skipped_prs": skipped_prs}
           with open("cascade_results.json", "w") as f:
               json.dump(results, f, indent=2)
-          print(f"\n      cascade_results.json written — ready for Step 3.")
+          print(f"\n      cascade_results.json written successfully.")
 
-          print(f"\n✅ Step 2 complete — Created: {len(created_prs)} | Skipped: {len(skipped_prs)}")
+          print(f"\n✅ Job 2 complete — Created: {len(created_prs)} | Skipped: {len(skipped_prs)}")
           print("=" * 60)
           EOF
 
-      # ───────────────────────────────────────────────────────────────────────
-      # STEP 3 — Send Email with PR Links
-      #
-      # What this step does:
-      #   1. Reads cascade_context.json  (PR details from Step 1)
-      #   2. Reads cascade_results.json  (created/skipped PRs from Step 2)
-      #   3. Sends an HTML email to all target branch leads with PR links
-      #
-      # Skipped automatically if Step 1 sets should_proceed=false
-      # ───────────────────────────────────────────────────────────────────────
-      - name: "Step 3 — Send Email with PR Links"
-        id: notify
-        if: steps.validate.outputs.should_proceed == 'true'
+      - name: Upload cascade results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cascade-results
+          path: cascade_results.json
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Notify via Email with PR Links
+  #
+  # Purpose:
+  #   Downloads cascade_context.json and cascade_results.json artifacts.
+  #   Sends an HTML email to all relevant team leads with clickable PR links.
+  #
+  # Runs only if:  Job 1 sets should_proceed = true  AND  Job 2 succeeds
+  # ───────────────────────────────────────────────────────────────────────────
+  notify:
+    name: "Step 3 — Notify via Email"
+    needs: [validate, create-prs]
+    if: needs.validate.outputs.should_proceed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Download cascade context from Job 1
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-context
+
+      - name: Download cascade results from Job 2
+        uses: actions/download-artifact@v4
+        with:
+          name: cascade-results
+
+      - name: Send email notification with PR links
         env:
           SMTP_HOST:     ${{ secrets.SMTP_HOST }}
           SMTP_PORT:     ${{ secrets.SMTP_PORT }}
@@ -307,10 +358,10 @@ jobs:
           from notifications.email_notifier import notify_forward_prs_created
 
           print("=" * 60)
-          print("STEP 3 — Send Email with PR Links")
+          print("JOB 3 — Notify via Email")
           print("=" * 60)
 
-          # ── Load context & results from previous steps ───────────────────
+          # ── Load artifacts from Jobs 1 & 2 ────────────────────────────
           print("\n[1/3] Loading cascade_context.json and cascade_results.json ...")
           with open("cascade_context.json") as f:
               ctx = json.load(f)
@@ -320,23 +371,26 @@ jobs:
           created_prs = results["created_prs"]
           skipped_prs = results["skipped_prs"]
 
-          print(f"      Hotfix branch : {ctx['hotfix_branch']}")
-          print(f"      Created PRs   : {len(created_prs)}")
-          print(f"      Skipped PRs   : {len(skipped_prs)}")
+          print(f"      Hotfix branch  : {ctx['hotfix_branch']}")
+          print(f"      Original PR    : #{ctx['pr_number']} — {ctx['pr_title']}")
+          print(f"      Created PRs    : {len(created_prs)}")
+          print(f"      Skipped PRs    : {len(skipped_prs)}")
 
-          # ── Resolve email recipients ─────────────────────────────────────
-          print("\n[2/3] Resolving email recipients from team-config.json ...")
+          # ── Log PR details ─────────────────────────────────────────────
+          print("\n[2/3] PR summary ...")
+          for pr in created_prs:
+              print(f"      ✅ PR #{pr['number']} : {ctx['hotfix_branch']} → {pr['target']}")
+              print(f"                URL  : {pr['url']}")
+          for pr in skipped_prs:
+              print(f"      ⚠️  SKIPPED       : {ctx['hotfix_branch']} → {pr['target']}")
+              print(f"                Reason: {pr['reason']}")
+
           if not created_prs and not skipped_prs:
               print("      No PRs to report — skipping email.")
               sys.exit(0)
 
-          for pr in created_prs:
-              print(f"      → PR #{pr['number']} : {ctx['hotfix_branch']} → {pr['target']}  ({pr['url']})")
-          for pr in skipped_prs:
-              print(f"      → SKIPPED         : {ctx['hotfix_branch']} → {pr['target']}  (reason: {pr['reason']})")
-
-          # ── Send notification email ──────────────────────────────────────
-          print("\n[3/3] Sending notification email ...")
+          # ── Send notification email ────────────────────────────────────
+          print("\n[3/3] Sending notification email to all target branch leads ...")
           notify_forward_prs_created(
               original_pr_number = ctx["pr_number"],
               original_pr_title  = ctx["pr_title"],
@@ -346,8 +400,7 @@ jobs:
               created_prs        = created_prs,
               skipped_prs        = skipped_prs,
           )
-
-          print(f"      Email sent to all target branch leads.")
-          print(f"\n✅ Step 3 complete — Notification dispatched.")
+          print(f"      Email dispatched to all target branch leads.")
+          print(f"\n✅ Job 3 complete — Pipeline finished successfully.")
           print("=" * 60)
           EOF
