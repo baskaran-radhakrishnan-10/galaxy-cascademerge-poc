@@ -48,7 +48,7 @@ jobs:
   #   artifact        →  cascade_context.json
   # ───────────────────────────────────────────────────────────────────────────
   validate:
-    name: "Step 1 — Validate, Derive & Lookup"
+    name: "🔍 Validate, Derive & Lookup"
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -180,7 +180,7 @@ jobs:
   # Output:        artifact → cascade_results.json
   # ───────────────────────────────────────────────────────────────────────────
   create-prs:
-    name: "Step 2 — Create Forward PRs"
+    name: "🔀 Create Forward PRs"
     needs: validate
     if: needs.validate.outputs.should_proceed == 'true'
     runs-on: ubuntu-latest
@@ -320,7 +320,7 @@ jobs:
   # Runs only if:  Job 1 sets should_proceed = true  AND  Job 2 succeeds
   # ───────────────────────────────────────────────────────────────────────────
   notify:
-    name: "Step 3 — Notify via Email"
+    name: "📧 Notify via Email"
     needs: [validate, create-prs]
     if: needs.validate.outputs.should_proceed == 'true'
     runs-on: ubuntu-latest
