@@ -165,7 +165,152 @@ def notify_hotfix_raised(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EMAIL TEMPLATE 2 — Merge Conflict Detected
+# EMAIL TEMPLATE 2 — Forward PRs Created
+# Triggered after the hotfix PR is merged.
+# Notifies all downstream branch leads with clickable PR links to review & merge.
+# ─────────────────────────────────────────────────────────────────────────────
+def notify_forward_prs_created(
+    original_pr_number: int,
+    original_pr_title: str,
+    original_pr_url: str,
+    author: str,
+    hotfix_branch: str,
+    created_prs: List[dict],   # [{"target": str, "url": str, "number": int}]
+    skipped_prs: List[dict],   # [{"target": str, "reason": str}]
+):
+    """
+    Notify dev leads of all target branches that forward PRs have been created
+    and are awaiting their review and merge.
+    """
+    all_targets = [p["target"] for p in created_prs] + [p["target"] for p in skipped_prs]
+    recipients: set = set()
+    for branch in all_targets:
+        recipients.update(get_recipients_for_branch(branch))
+    recipient_list = list(recipients)
+
+    subject = (
+        f"[Galaxy OB] \U0001f500 Action Required \u2014 Forward PRs Created "
+        f"from {hotfix_branch} (#{original_pr_number})"
+    )
+
+    created_rows = "".join(
+        f"<tr>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;"
+        f"font-family:monospace;'>{p['target']}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;'>"
+        f"<a href='{p['url']}' style='color:#1a3c5e;font-weight:bold;'>"
+        f"PR #{p['number']}</a></td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;"
+        f"color:#27ae60;'>\u2705 Created \u2014 Awaiting Review</td>"
+        f"</tr>"
+        for p in created_prs
+    )
+
+    skipped_rows = "".join(
+        f"<tr>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;"
+        f"font-family:monospace;'>{p['target']}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;"
+        f"color:#888;'>\u2014</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;"
+        f"color:#e67e22;'>\u26a0\ufe0f {p['reason']}</td>"
+        f"</tr>"
+        for p in skipped_prs
+    )
+
+    skipped_warning = (
+        "<div style='background:#fef9e7;border-left:4px solid #e67e22;"
+        "padding:12px 20px;margin:16px 0;font-size:13px;'>"
+        "<strong>⚠️ Some forward PRs could not be created automatically.</strong><br/>"
+        "Please create them manually to ensure the hotfix is not missed."
+        "</div>"
+        if skipped_prs else ""
+    )
+
+    original_pr_link = (
+        f"<a href='{original_pr_url}' style='color:#1a3c5e;'>#{original_pr_number}</a>"
+        if original_pr_url else f"#{original_pr_number}"
+    )
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;
+                border:1px solid #ddd;border-radius:6px;overflow:hidden;">
+
+      <!-- Header -->
+      <div style="background:#1a3c5e;padding:18px 24px;">
+        <h2 style="color:#fff;margin:0;">Galaxy Open Banking</h2>
+        <p style="color:#aac4e0;margin:4px 0 0;">\U0001f500 Cascade Forward PRs Created</p>
+      </div>
+
+      <!-- Action Banner -->
+      <div style="background:#eaf4fb;border-left:4px solid #1a3c5e;
+                  padding:14px 20px;">
+        <strong>Action Required:</strong> Forward PRs have been automatically created below.
+        Please review and merge each one to propagate the hotfix into your branch.
+      </div>
+
+      <!-- Body -->
+      <div style="padding:24px;">
+
+        <h3 style="color:#1a3c5e;margin-top:0;">Original Hotfix PR</h3>
+        <table style="width:100%;border-collapse:collapse;background:#f9f9f9;
+                      border-radius:4px;margin-bottom:20px;">
+          <tr>
+            <td style="padding:8px 12px;font-weight:bold;width:40%;">PR Number</td>
+            <td style="padding:8px 12px;">{original_pr_link}</td>
+          </tr>
+          <tr style="background:#f0f4f8;">
+            <td style="padding:8px 12px;font-weight:bold;">Title</td>
+            <td style="padding:8px 12px;">{original_pr_title}</td>
+          </tr>
+          <tr>
+            <td style="padding:8px 12px;font-weight:bold;">Merged By</td>
+            <td style="padding:8px 12px;">{author}</td>
+          </tr>
+          <tr style="background:#f0f4f8;">
+            <td style="padding:8px 12px;font-weight:bold;">Hotfix Branch</td>
+            <td style="padding:8px 12px;font-family:monospace;">{hotfix_branch}</td>
+          </tr>
+        </table>
+
+        <h3 style="color:#1a3c5e;">Forward PRs \u2014 Please Review &amp; Merge</h3>
+        <table style="width:100%;border-collapse:collapse;">
+          <thead>
+            <tr style="background:#1a3c5e;color:#fff;">
+              <th style="padding:8px 12px;text-align:left;">Target Branch</th>
+              <th style="padding:8px 12px;text-align:left;">PR Link</th>
+              <th style="padding:8px 12px;text-align:left;">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {created_rows}
+            {skipped_rows}
+          </tbody>
+        </table>
+
+        {skipped_warning}
+
+        <p style="font-size:13px;color:#555;margin-top:20px;">
+          \u2139\ufe0f Each forward PR must be individually reviewed and merged by the
+          respective branch lead. Do <strong>not</strong> close a PR without merging
+          unless the fix is explicitly not applicable to that branch.
+        </p>
+
+      </div>
+
+      <!-- Footer -->
+      <div style="background:#f0f4f8;padding:12px 24px;font-size:12px;color:#888;">
+        Galaxy Open Banking \u2014 Automated Cascade Notification
+        | {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} UTC
+      </div>
+    </div>
+    """
+
+    send_email(subject, html_body, recipient_list)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL TEMPLATE 3 — Merge Conflict Detected
 # Triggered when the cascade pipeline stops due to a conflict.
 # ─────────────────────────────────────────────────────────────────────────────
 def notify_merge_conflict(
